@@ -1,71 +1,113 @@
 import os
 import json
 import glob
+import csv
+from collections import Counter
+from tqdm import tqdm
 
-def load_json_file(filepath):
-    """
-    Attempt to load a JSON object from a file.
-    If the JSON is complete but wrapped in triple backticks (```), they will be removed.
-    If the JSON is truncated or cannot be loaded, the file is skipped and a note is printed.
+def get_impact_info(epd_json, impact_filter='global warming'):
+    impacts = epd_json.get("epd_impacts", [])
+    for impact in impacts:
+        if impact_filter.lower() in impact.get("impact_category", "").lower():
+            return impact
+    return None
 
-    Returns:
-        A JSON object (dictionary) if successfully loaded, or None if failed.
-    """
-    with open(filepath, 'r', encoding='utf-8') as f:
-        content = f.read().strip()
+def is_placeholder_entry(entry):
+    return (
+        entry.get('product_names') == ['Product Name'] or
+        entry.get('product_ids') == ['Product ID'] or
+        entry.get('product_description') == ['Product Description']
+    )
 
-    # Remove triple backticks if present at the beginning and/or end.
-    if content.startswith("```"):
-        content = content[3:]
-    if content.endswith("```"):
-        content = content[:-3]
-    content = content.strip()
+def has_valid_impact(impact_info):
+    keys_to_check = ['A1', 'A2', 'A3', 'A4', 'A5', 'A1_A3_total']
+    return any(impact_info.get(key) not in [0, None] for key in keys_to_check)
 
-    try:
-        # Attempt to load the cleaned JSON string.
-        data = json.loads(content)
-        return data
-    except json.JSONDecodeError as e:
-        # Log the error and note that the JSON might be truncated.
-        print(f"JSON decoding error in {filepath}: {e}. Possibly truncated JSON. Skipping.")
-        return None
+def clean_json(entry, impact_info):
+    entry['epd_impacts'] = [impact_info]
+    return entry
 
-def load_json_files(filepaths):
-    """
-    Given a list of file paths, attempt to load each JSON file using load_json_file.
-    Returns a list of successfully loaded JSON objects.
-    """
-    data_list = []
-    for filepath in filepaths:
-        data = load_json_file(filepath)
-        if data is not None:
-            data_list.append(data)
-    return data_list
+def process_json_directory(directory_path, known_products=None, status_log=None):
+    all_files = glob.glob(os.path.join(directory_path, "*.json"))
+    processed_data = []
 
+    for filepath in tqdm(all_files, desc=f"Processing {directory_path}"):
+        file_name = os.path.basename(filepath)
+        folder_name = os.path.basename(directory_path)
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+
+            if content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+            content = content.strip()
+
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                status_log.append([folder_name, file_name, 'json_validation_error'])
+                continue
+
+            if is_placeholder_entry(data):
+                status_log.append([folder_name, file_name, 'null_values'])
+                continue
+
+            impact_info = get_impact_info(data)
+            if not impact_info or not has_valid_impact(impact_info):
+                status_log.append([folder_name, file_name, 'null_values'])
+                continue
+
+            product_key = (
+                tuple(data.get('product_names', [])),
+                tuple(data.get('product_ids', [])),
+                tuple(data.get('product_description', []))
+            )
+
+            if known_products is not None and product_key in known_products:
+                status_log.append([folder_name, file_name, 'duplicate_values'])
+                continue
+
+            processed_data.append(clean_json(data, impact_info))
+            if known_products is not None:
+                known_products.add(product_key)
+
+            status_log.append([folder_name, file_name, 'processed'])
+
+        except Exception as e:
+            status_log.append([folder_name, file_name, 'error'])
+            print(f"Failed to load {filepath}: {e}")
+            continue
+
+    return processed_data
 
 if __name__ == '__main__':
-    # Replace this with the path to your JSON files directory.
-    directory_path = "/home/stirunag/Downloads/Downloaded_EPD_JSON-20250327T001140Z-001/Downloaded_EPD_JSON"  # Replace with your JSON directory path
-    all_files = glob.glob(os.path.join(directory_path, "*.json"))
-    data = load_json_files(all_files)
-    print(f"Loaded {len(data)} JSON objects.")
+    directory_path_0 = "/home/stirunag/Downloads/Complete_EPD_JSON-20250411T185504Z-001/Complete_EPD_JSON"
+    directory_path_1 = "/home/stirunag/Downloads/Downloaded_EPD_JSON-20250327T001140Z-001/Downloaded_EPD_JSON"
 
-    # Assume 'data' is your processed list of JSON objects
-    output_file = 'data/processed_json_data.json'
+    known_products = set()
+    status_log = []
+
+    data_0 = process_json_directory(directory_path_0, known_products, status_log)
+    print(f"Directory 0: {len(data_0)} valid JSONs")
+
+    data_1 = process_json_directory(directory_path_1, known_products, status_log)
+    print(f"Directory 1: {len(data_1)} new non-duplicate JSONs")
+
+    final_data = data_0 + data_1
+    output_file = 'data/revised_processed_json_data_v01.json'
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(final_data, f, ensure_ascii=False, indent=2)
 
-    print(f"Data saved to {output_file}")
+    print(f"Total saved: {len(final_data)} JSONs -> {output_file}")
 
+    # Save status log to CSV
+    log_file = 'data/processing_log.csv'
+    with open(log_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['folder_name', 'file_name', 'status'])
+        writer.writerows(status_log)
 
-# # Example usage:
-#
-# all_json_data = load_json_files(directory_path)
-#
-# # Preprocess each JSON file and store the result
-# processed_data = [preprocess_epd_json(epd) for epd in all_json_data]
-#
-# # For example, let's inspect the first processed JSON
-# import pprint
-#
-# pprint.pprint(processed_data[0])
+    print(f"Log saved: {log_file}")
